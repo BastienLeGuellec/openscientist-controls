@@ -1,0 +1,55 @@
+diff --git a/Dockerfile b/Dockerfile
+index e359ce72..bd8ae236 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -13,7 +13,7 @@ ARG CODEX_REPO=https://github.com/LucaCappelletti94/codex.git
+ ARG CODEX_REF=8f8009fcab89baafa51c15c9542734b1c94de8b6
+ RUN git clone "${CODEX_REPO}" /codex \
+     && git -C /codex checkout "${CODEX_REF}" \
+-    && cargo build --release --manifest-path /codex/codex-rs/Cargo.toml -p codex-cli \
++    && CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release -j 2 --manifest-path /codex/codex-rs/Cargo.toml -p codex-cli \
+     && cp /codex/codex-rs/target/release/codex /usr/local/bin/codex
+ 
+ FROM openscientist-base:latest
+diff --git a/Dockerfile.agent b/Dockerfile.agent
+index 56446e76..aa61c60c 100644
+--- a/Dockerfile.agent
++++ b/Dockerfile.agent
+@@ -23,7 +23,7 @@ ARG CODEX_REPO=https://github.com/LucaCappelletti94/codex.git
+ ARG CODEX_REF=8f8009fcab89baafa51c15c9542734b1c94de8b6
+ RUN git clone "${CODEX_REPO}" /codex \
+     && git -C /codex checkout "${CODEX_REF}" \
+-    && cargo build --release --manifest-path /codex/codex-rs/Cargo.toml -p codex-cli \
++    && CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release -j 2 --manifest-path /codex/codex-rs/Cargo.toml -p codex-cli \
+     && cp /codex/codex-rs/target/release/codex /usr/local/bin/codex
+ 
+ FROM openscientist-base:latest
+diff --git a/Dockerfile.executor b/Dockerfile.executor
+index b601ad8e..ac053107 100644
+--- a/Dockerfile.executor
++++ b/Dockerfile.executor
+@@ -29,7 +29,7 @@ ENV PATH="$CARGO_HOME/bin:$PATH"
+ # The compiled artifacts are kept in CARGO_TARGET_DIR so subsequent
+ # cargo builds (same dep versions) reuse them without recompiling.
+ COPY cargo-seed /tmp/cargo-seed
+-RUN cargo build --manifest-path /tmp/cargo-seed/Cargo.toml \
++RUN cargo build -j 2 --manifest-path /tmp/cargo-seed/Cargo.toml \
+     && rm -rf /tmp/cargo-seed \
+     && chmod -R a+rwX $CARGO_HOME
+ 
+diff --git a/src/openscientist/providers/anthropic.py b/src/openscientist/providers/anthropic.py
+index 87f71b0e..7922cd14 100644
+--- a/src/openscientist/providers/anthropic.py
++++ b/src/openscientist/providers/anthropic.py
+@@ -71,8 +71,10 @@ class AnthropicProvider(ClaudeCompatible):
+ 
+     def llm_upstream(self) -> LlmUpstream | None:
+         p = get_settings().provider
++        # honour ANTHROPIC_BASE_URL (e.g. an Anthropic-compatible gateway); upstream ignored it
++        base = (p.anthropic_base_url or "https://api.anthropic.com").rstrip("/")
+         if p.anthropic_api_key:
+-            return LlmUpstream("https://api.anthropic.com", {"x-api-key": p.anthropic_api_key})
++            return LlmUpstream(base, {"x-api-key": p.anthropic_api_key})
+         if p.claude_code_oauth_token:
+             return LlmUpstream(
+                 "https://api.anthropic.com",

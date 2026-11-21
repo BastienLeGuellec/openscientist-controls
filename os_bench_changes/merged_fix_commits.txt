@@ -1,0 +1,10 @@
+1366e827 Fix test typing so mypy --strict passes
+e3256257 Record and price all five token buckets, not just input and output
+40aa28a2 Bump claude-agent-sdk so the Claude harness can run Opus 4.7+
+505c914d Make missing MCP tools fatal, not a failed turn
+9e816d9a Wrap the registered ListTools handler so the marker is actually written
+0a0ca016 Detect the missing tools from the server side, not the agent's tool choices
+2b77ee11 Fail a turn whose openscientist-tools MCP tools never registered
+ecc2e053 Forward the operator's context-window pin into the job container
+4651f942 Namespace MCP tool names in the turn prompt and skills, not just the system prompt
+48da4b8a Install image dependencies from uv.lock instead of re-resolving

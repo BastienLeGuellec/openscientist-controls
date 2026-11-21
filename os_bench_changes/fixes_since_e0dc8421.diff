@@ -1,0 +1,748 @@
+diff --git a/Dockerfile.agent b/Dockerfile.agent
+index a876cfe2..56446e76 100644
+--- a/Dockerfile.agent
++++ b/Dockerfile.agent
+@@ -57,15 +57,25 @@ RUN useradd --uid 1001 --create-home --shell /bin/bash agent
+ 
+ WORKDIR /app
+ 
+-# Copy project files (README.md required by pyproject.toml readme field)
+-COPY pyproject.toml README.md uv.lock* ./
++# Copy project files (README.md required by pyproject.toml readme field).
++# uv.lock is required, not optional: --frozen below must fail loudly rather than
++# silently fall back to a fresh resolve, which is the bug this guards against.
++COPY pyproject.toml README.md uv.lock ./
+ COPY src/ ./src/
+ 
+ # Install dependencies including claude-agent-sdk and openai-codex (both listed
+ # in pyproject.toml). The official openai-codex bundles its codex binary only as
+ # a musl wheel, which is dropped via the uv override in pyproject.toml. The
+ # binary is provisioned separately below.
+-RUN uv pip install --system -e .
++#
++# From the lock, for the reason spelled out in Dockerfile.base: a fresh resolve
++# here is what let mcp reach 2.x and killed the MCP tools server in this very
++# image, invisibly, because CI installs from the lock and stayed green.
++RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt \
++        -o /tmp/requirements.txt \
++    && uv pip install --system -r /tmp/requirements.txt \
++    && uv pip install --system --no-deps -e . \
++    && rm /tmp/requirements.txt
+ 
+ # Install the open-codex CLI built in the codex-build stage above (namespace
+ # tools, function apply_patch, web_search capability gate, and the apply_patch
+diff --git a/Dockerfile.base b/Dockerfile.base
+index cf3caa90..f0166045 100644
+--- a/Dockerfile.base
++++ b/Dockerfile.base
+@@ -35,8 +35,18 @@ COPY pyproject.toml uv.lock README.md ./
+ # Stub package so uv can do the editable install
+ RUN mkdir -p src/openscientist && touch src/openscientist/__init__.py
+ 
+-# Install all deps — cached until pyproject.toml or uv.lock changes
+-RUN uv pip install --system -e .
++# Install deps from the lock — cached until pyproject.toml or uv.lock changes.
++# `uv pip install -e .` re-resolves pyproject and never reads uv.lock, so the
++# image drifted from the dependency set CI tests: mcp floated to 2.x, which
++# dropped mcp.server.fastmcp and took the openscientist-tools MCP server down in
++# every container job while CI stayed green on the locked 1.x. Export pins the
++# locked versions; the project goes in after with --no-deps so it cannot pull
++# anything unlocked back in.
++RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt \
++        -o /tmp/requirements.txt \
++    && uv pip install --system -r /tmp/requirements.txt \
++    && uv pip install --system --no-deps -e . \
++    && rm /tmp/requirements.txt
+ 
+ # Smoke test: verify WeasyPrint can render text + images
+ RUN python -c "\
+diff --git a/src/openscientist/agent/base.py b/src/openscientist/agent/base.py
+index 77b0ce5a..47be20e1 100644
+--- a/src/openscientist/agent/base.py
++++ b/src/openscientist/agent/base.py
+@@ -313,9 +313,16 @@ class AbstractAgent[P: Provider](abc.ABC):
+     def _write_skill(self, skills_root: Path, skill: Skill) -> None:
+         """Write one skill as ``<skills_root>/<name>/SKILL.md`` (the Agent
+         Skills layout codex and omp discover). Claude overrides for its own."""
++        from openscientist.prompts.common import apply_mcp_tool_prefix
++
+         skill_dir = skills_root / f"{skill.category}--{skill.slug}"
+         skill_dir.mkdir(parents=True, exist_ok=True)
+-        (skill_dir / "SKILL.md").write_text(render_skill_md(skill), encoding="utf-8")
++        # Skill bodies name MCP tools bare like the rest of the prompts, so a
++        # backend that namespaces them needs the same rewrite the system and turn
++        # prompts get; otherwise a skill teaches a name that will not resolve.
++        # No-op wherever the prefix is empty, which is Claude and codex.
++        body = apply_mcp_tool_prefix(render_skill_md(skill), self.prompt_fragments())
++        (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+ 
+     def _job_env_overlay(self, job_dir: Path) -> dict[str, str]:
+         """Per-job ``OPENSCIENTIST_*`` env for the tools subprocess. Each backend
+diff --git a/src/openscientist/agent/omp_agent.py b/src/openscientist/agent/omp_agent.py
+index 1c00d7df..76091a85 100644
+--- a/src/openscientist/agent/omp_agent.py
++++ b/src/openscientist/agent/omp_agent.py
+@@ -30,6 +30,7 @@ from openscientist.agent.base import (
+     TokenUsage,
+     TurnOutcome,
+ )
++from openscientist.exceptions import McpToolsUnavailableError
+ from openscientist.providers.base import LLM_PROXY_URL_ENV, Provider
+ from openscientist.settings import get_settings
+ from openscientist.transcript import OMP, TranscriptEntry
+@@ -227,10 +228,18 @@ class OmpAgent(AbstractAgent[Provider]):
+ 
+     def _write_turn_prompt(self, prompt: str) -> Path:
+         # Passed as ``@<path>`` so a large prompt never hits the argv limit.
++        from openscientist.prompts.common import apply_mcp_tool_prefix
++
+         omp_dir = self._omp_dir()
+         omp_dir.mkdir(parents=True, exist_ok=True)
+         path = omp_dir / "turn_prompt.md"
+-        path.write_text(prompt, encoding="utf-8")
++        # The orchestrator builds the turn prompt backend-agnostically, so it
++        # names MCP tools bare -- right for Claude and codex, but omp exposes
++        # them as mcp__openscientist_tools_<name>, and a bare name comes back
++        # "Tool <name> not found". prompts.common already rewrites the system
++        # prompt; the per-turn instructions were missed, and those are the copy
++        # the model acts on, so every execute_code call failed.
++        path.write_text(apply_mcp_tool_prefix(prompt, self.prompt_fragments()), encoding="utf-8")
+         return path
+ 
+     def _write_omp_model_catalog(self) -> None:
+@@ -357,6 +366,24 @@ class OmpAgent(AbstractAgent[Provider]):
+         ]
+         return "".join(parts)
+ 
++    def _mcp_handshake_marker(self) -> Path:
++        """Touched by the tools server when a client asks for its tool inventory."""
++        return self._omp_dir() / "mcp_handshake"
++
++    def _mcp_handshake_seen(self) -> bool:
++        """True if openscientist-tools was asked for its tools during this run.
++
++        Counting the agent's own MCP calls cannot answer this: a report turn
++        legitimately writes the file with the built-in ``write`` and calls no MCP
++        tool at all, and omp exposes no way to ask which servers it connected to.
++        The server records the handshake itself instead.
++        """
++        return self._mcp_handshake_marker().exists()
++
++    def _clear_mcp_handshake(self) -> None:
++        """Drop any marker from an earlier turn so it only describes this run."""
++        self._mcp_handshake_marker().unlink(missing_ok=True)
++
+     @staticmethod
+     def _count_tool_calls(messages: list[dict[str, Any]]) -> int:
+         count = 0
+@@ -430,6 +457,7 @@ class OmpAgent(AbstractAgent[Provider]):
+         system_prompt_path = self._write_system_prompt()
+         self._write_mcp_config()
+         config_path = self._write_omp_config()
++        self._clear_mcp_handshake()
+         prompt_path = self._write_turn_prompt(prompt)
+         args = self._build_args(system_prompt_path, prompt_path, config_path)
+ 
+@@ -572,7 +600,36 @@ class OmpAgent(AbstractAgent[Provider]):
+         try:
+             # No wait_for here: _run_omp owns the timeout so it can stop the
+             # process tree and keep the output that already arrived.
+-            return await self._run_omp(prompt)
++            result = await self._run_omp(prompt)
++
++            # omp sometimes issues the model request before it has asked
++            # openscientist-tools for its tool list, leaving the agent with only
++            # omp's built-ins and no error on any channel (openscientist-io#263).
++            # The server touches a marker when asked, so its absence means the
++            # agent had no execute_code and no way to record anything.
++            #
++            # This is fatal, not a failed turn: the orchestrator treats a failed
++            # report turn as recoverable and completes the job if a report file
++            # exists, and the agent can still write one with the built-in `write`
++            # -- which is exactly the confident-report-over-nothing outcome this
++            # is meant to stop.
++            if result.outcome is TurnOutcome.COMPLETED and not self._mcp_handshake_seen():
++                logger.warning(
++                    "openscientist-tools was never asked for its tool inventory this "
++                    "turn, so the agent had no MCP tools. Retrying the turn once."
++                )
++                result = await self._run_omp(prompt)
++                if not self._mcp_handshake_seen():
++                    raise McpToolsUnavailableError(
++                        "openscientist-tools MCP tools were not available to the agent "
++                        "after a retry (see openscientist-io#263)"
++                    )
++            return result
++        except McpToolsUnavailableError:
++            # Fatal by design: let it reach the orchestrator so the job fails
++            # rather than completing over an empty knowledge state.
++            logger.error("openscientist-tools MCP tools unavailable; failing the job")
++            raise
+         except Exception as e:
+             logger.error("omp run failed: %s", e, exc_info=True)
+             return IterationResult(
+diff --git a/src/openscientist/database/migrations/versions/2026-08-12_1200_add_token_buckets_to_cost_records.py b/src/openscientist/database/migrations/versions/2026-08-12_1200_add_token_buckets_to_cost_records.py
+new file mode 100644
+index 00000000..5d9808be
+--- /dev/null
++++ b/src/openscientist/database/migrations/versions/2026-08-12_1200_add_token_buckets_to_cost_records.py
+@@ -0,0 +1,46 @@
++"""Add cache and reasoning token columns to cost_records.
++
++TokenUsage has always carried five non-overlapping buckets, but only input and
++output were persisted. Cached reads dominate agentic runs -- every turn resends
++the conversation -- so cost computed from two buckets understates reality
++without any sign that it has, and per-model token comparisons are meaningless.
++
++Revision ID: add_token_buckets
++Revises: add_pubmed_mirror
++Create Date: 2026-08-12 12:00:00
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "add_token_buckets"
++down_revision: str | None = "add_pubmed_mirror"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++_COLUMNS = (
++    ("cache_read_tokens", "Prompt tokens served from cache"),
++    ("cache_write_tokens", "Prompt tokens written to cache"),
++    ("reasoning_tokens", "Reasoning tokens reported separately from output"),
++)
++
++
++def upgrade() -> None:
++    for name, comment in _COLUMNS:
++        op.add_column(
++            "cost_records",
++            sa.Column(
++                name,
++                sa.Integer(),
++                nullable=False,
++                server_default="0",
++                comment=comment,
++            ),
++        )
++
++
++def downgrade() -> None:
++    for name, _ in reversed(_COLUMNS):
++        op.drop_column("cost_records", name)
+diff --git a/src/openscientist/database/models/cost_record.py b/src/openscientist/database/models/cost_record.py
+index 72dcf9ac..f2c98dff 100644
+--- a/src/openscientist/database/models/cost_record.py
++++ b/src/openscientist/database/models/cost_record.py
+@@ -31,8 +31,13 @@ class CostRecord(UUIDv7Mixin, Base):
+         operation_type: Type of operation (analysis/code_gen/chat/etc)
+         provider: LLM provider (vertex/bedrock/cborg)
+         model: Model name/ID used
+-        input_tokens: Number of input tokens
+-        output_tokens: Number of output tokens
++        input_tokens: Uncached prompt tokens
++        output_tokens: Generated tokens
++        cache_read_tokens: Prompt tokens served from cache (billed at a
++            fraction of input; the largest bucket in agentic runs)
++        cache_write_tokens: Prompt tokens written to cache
++        reasoning_tokens: Reasoning tokens, where the provider reports them
++            separately rather than inside output
+         cost_usd: Cost in USD
+         job: Related Job object
+     """
+@@ -83,6 +88,27 @@ class CostRecord(UUIDv7Mixin, Base):
+         comment="Number of output tokens",
+     )
+ 
++    cache_read_tokens: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        server_default="0",
++        comment="Prompt tokens served from cache",
++    )
++
++    cache_write_tokens: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        server_default="0",
++        comment="Prompt tokens written to cache",
++    )
++
++    reasoning_tokens: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        server_default="0",
++        comment="Reasoning tokens reported separately from output",
++    )
++
+     cost_usd: Mapped[float] = mapped_column(
+         Float,
+         nullable=False,
+diff --git a/src/openscientist/exceptions.py b/src/openscientist/exceptions.py
+index 171334c5..eeb7123a 100644
+--- a/src/openscientist/exceptions.py
++++ b/src/openscientist/exceptions.py
+@@ -56,3 +56,12 @@ class ProviderError(OpenScientistError):
+ 
+ class PDFGenerationError(OpenScientistError):
+     """Raised when PDF report generation fails."""
++
++
++class McpToolsUnavailableError(OpenScientistError):
++    """The agent ran without the openscientist-tools MCP tools.
++
++    Fatal rather than a failed turn: the agent cannot analyse or record
++    anything, and the condition persists across turns, so continuing produces a
++    report with nothing behind it (openscientist-io#263).
++    """
+diff --git a/src/openscientist/orchestrator/discovery.py b/src/openscientist/orchestrator/discovery.py
+index 31d8c7e4..1b090818 100644
+--- a/src/openscientist/orchestrator/discovery.py
++++ b/src/openscientist/orchestrator/discovery.py
+@@ -610,7 +610,14 @@ async def _persist_job_cost_record(
+     from openscientist.database.models import CostRecord
+     from openscientist.providers.pricing import estimate_cost_usd
+ 
+-    cost_usd = estimate_cost_usd(model_name, tokens.input_tokens, tokens.output_tokens)
++    cost_usd = estimate_cost_usd(
++        model_name,
++        tokens.input_tokens,
++        tokens.output_tokens,
++        tokens.cache_read_tokens,
++        tokens.cache_write_tokens,
++        tokens.reasoning_tokens,
++    )
+     async with AsyncSessionLocal(thread_safe=True) as session:
+         record = CostRecord(
+             job_id=UUID(job_id),
+@@ -620,6 +627,9 @@ async def _persist_job_cost_record(
+             model=model_name,
+             input_tokens=tokens.input_tokens,
+             output_tokens=tokens.output_tokens,
++            cache_read_tokens=tokens.cache_read_tokens,
++            cache_write_tokens=tokens.cache_write_tokens,
++            reasoning_tokens=tokens.reasoning_tokens,
+             cost_usd=cost_usd,
+         )
+         session.add(record)
+@@ -634,9 +644,13 @@ async def _finalize_executor(executor: AbstractAgent[Provider], job_id: str) ->
+     """
+     tokens = executor.total_tokens
+     logger.info(
+-        "Agent executor completed: %d input tokens, %d output tokens",
++        "Agent executor completed: %d input, %d output, %d cache read, "
++        "%d cache write, %d reasoning tokens",
+         tokens.input_tokens,
+         tokens.output_tokens,
++        tokens.cache_read_tokens,
++        tokens.cache_write_tokens,
++        tokens.reasoning_tokens,
+     )
+     try:
+         settings = get_settings()
+diff --git a/src/openscientist/providers/base.py b/src/openscientist/providers/base.py
+index ec18eb4d..d87a4260 100644
+--- a/src/openscientist/providers/base.py
++++ b/src/openscientist/providers/base.py
+@@ -324,10 +324,15 @@ class Provider(abc.ABC):
+     def prelaunch_model_context_env(self) -> dict[str, str]:
+         """Window resolved app-side and injected as ``OPENSCIENTIST_MODEL_CONTEXT_TOKENS``,
+         because the proxied container cannot probe a root path like llama.cpp's ``/props``.
+-        Empty when the operator pinned the window or the provider does not probe.
++        Empty only when nothing is pinned and the provider does not probe.
+         """
+-        if get_settings().provider.model_context_tokens is not None:
+-            return {}
++        pinned = get_settings().provider.model_context_tokens
++        if pinned is not None:
++            # Pass the pin on rather than skip it. It is set in this process's
++            # environment, but the container resolves the window again on its own
++            # side, so returning nothing here left it probing -- the very thing
++            # pinning exists to avoid -- and silently taking the 8192 fallback.
++            return {"OPENSCIENTIST_MODEL_CONTEXT_TOKENS": str(pinned)}
+         window = self.probe_context_window()
+         if not window:
+             return {}
+diff --git a/src/openscientist/providers/pricing.py b/src/openscientist/providers/pricing.py
+index e034b3ae..22cff476 100644
+--- a/src/openscientist/providers/pricing.py
++++ b/src/openscientist/providers/pricing.py
+@@ -54,20 +54,50 @@ def normalize_model_name(model: str) -> str:
+     return model
+ 
+ 
+-def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
++def estimate_cost_usd(
++    model: str,
++    input_tokens: int,
++    output_tokens: int,
++    cache_read_tokens: int = 0,
++    cache_write_tokens: int = 0,
++    reasoning_tokens: int = 0,
++) -> float:
+     """
+     Estimate cost in USD using the litellm pricing database.
+ 
+-    Tries exact key first, then the normalised model name.
+-    Returns 0.0 if no pricing entry is found.
++    Prices every billed bucket, not just input and output. Cached reads dominate
++    agentic runs -- each turn resends the conversation -- so omitting them
++    understates cost badly, and the caller cannot tell because the total is still
++    a plausible number. Reasoning tokens are billed as output where a provider
++    reports them separately.
++
++    Falls back to the input rate for cache reads/writes when the entry carries no
++    cache-specific rate: wrong, but closer than charging zero.
++
++    Tries exact key first, then the normalised model name. Returns 0.0 and warns
++    if no pricing entry is found, so a silent zero is at least visible in logs.
+     """
+     pricing = _get_litellm_pricing()
+     entry = pricing.get(model) or pricing.get(normalize_model_name(model))
+     if not entry:
++        logger.warning(
++            "No pricing entry for model %r (normalised %r); reporting $0.00. "
++            "Cost tracking for this model is not meaningful until a rate is added.",
++            model,
++            normalize_model_name(model),
++        )
+         return 0.0
+     in_rate = float(entry.get("input_cost_per_token", 0.0))
+     out_rate = float(entry.get("output_cost_per_token", 0.0))
+-    return in_rate * input_tokens + out_rate * output_tokens
++    read_rate = float(entry.get("cache_read_input_token_cost", in_rate))
++    write_rate = float(entry.get("cache_creation_input_token_cost", in_rate))
++    return (
++        in_rate * input_tokens
++        + out_rate * output_tokens
++        + read_rate * cache_read_tokens
++        + write_rate * cache_write_tokens
++        + out_rate * reasoning_tokens
++    )
+ 
+ 
+ # Fallback used only when the remote fetch fails and the cache is empty.
+diff --git a/src/openscientist_tools/__main__.py b/src/openscientist_tools/__main__.py
+index 045d76cf..4f1b4b92 100644
+--- a/src/openscientist_tools/__main__.py
++++ b/src/openscientist_tools/__main__.py
+@@ -2,7 +2,48 @@
+ 
+ from __future__ import annotations
+ 
++import os
++from pathlib import Path
++from typing import Any
++
++import mcp.types as types
++
+ from openscientist_tools.server import mcp
+ 
++#: Touched the first time a client asks for the tool inventory. The harness has
++#: no way to ask omp which MCP servers it connected to, so the server records the
++#: handshake itself and OmpAgent reads the marker (openscientist-io#263).
++HANDSHAKE_MARKER = "mcp_handshake"
++
++
++def _install_handshake_marker() -> None:
++    """Record that a client requested our tools, by wrapping the live handler.
++
++    The wrap has to go on ``request_handlers``: ``FastMCP`` binds its own
++    ``list_tools`` into that table at construction, so replacing the attribute
++    afterwards leaves the registered handler untouched and the marker unwritten.
++    """
++    job_dir = os.environ.get("OPENSCIENTIST_JOB_DIR")
++    if not job_dir:
++        return
++    marker = Path(job_dir) / ".omp" / HANDSHAKE_MARKER
++    handlers = mcp._mcp_server.request_handlers
++    original = handlers.get(types.ListToolsRequest)
++    if original is None:
++        return
++
++    async def record_then_list(*args: Any, **kwargs: Any) -> Any:
++        try:
++            marker.parent.mkdir(parents=True, exist_ok=True)
++            marker.touch()
++        except OSError:
++            # Diagnostics only; never fail a tools/list over the marker.
++            pass
++        return await original(*args, **kwargs)
++
++    handlers[types.ListToolsRequest] = record_then_list
++
++
+ if __name__ == "__main__":
++    _install_handshake_marker()
+     mcp.run()
+diff --git a/tests/agent/test_omp_agent.py b/tests/agent/test_omp_agent.py
+index 848ff26c..accbadfd 100644
+--- a/tests/agent/test_omp_agent.py
++++ b/tests/agent/test_omp_agent.py
+@@ -16,6 +16,7 @@ import pytest
+ 
+ from openscientist.agent.base import AgentConfig, TurnOutcome
+ from openscientist.agent.omp_agent import OmpAgent
++from openscientist.exceptions import McpToolsUnavailableError
+ from openscientist.models import ModelProfile
+ from openscientist.providers.base import OmpModelCatalog, self_hosted_omp_model_catalog
+ from openscientist.transcript import AssistantText, Reasoning, ToolCall, ToolResult, UserPrompt
+@@ -105,7 +106,9 @@ def _write_stub(path: Path, stream: list[dict[str, object]]) -> None:
+     """Write a fake-omp that records argv and emits ``stream``.
+ 
+     Env knobs: ``OMP_STUB_ARGV_OUT``, ``OMP_STUB_SLEEP``, ``OMP_STUB_EXIT``,
+-    ``OMP_STUB_EMIT``, ``OMP_STUB_EMIT_FIRST`` (emit before sleeping, so a
++    ``OMP_STUB_EMIT``, ``OMP_STUB_MCP_HANDSHAKE`` (write the marker the
++    tools server writes when asked for its tools; "0" simulates a run where omp
++    never registered it), ``OMP_STUB_EMIT_FIRST`` (emit before sleeping, so a
+     timeout still has a partial stream to parse), and ``OMP_STUB_CHILD_PID_OUT``
+     (spawn a long-lived grandchild and record its pid, standing in for the MCP
+     server children real omp starts).
+@@ -124,6 +127,18 @@ if child_out:
+         fh.write(str(child.pid))
+ 
+ 
++def write_mcp_handshake():
++    # Real openscientist-tools touches this when a client asks for its tools.
++    if os.environ.get("OMP_STUB_MCP_HANDSHAKE", "1") != "1":
++        return
++    cwd = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--cwd=")), "")
++    if not cwd:
++        return
++    d = os.path.join(cwd, ".omp")
++    os.makedirs(d, exist_ok=True)
++    open(os.path.join(d, "mcp_handshake"), "w").close()
++
++
+ def write_session():
+     # Real omp only writes <timestamp>_<id>.jsonl once the turn has something to
+     # save, so a stub that always wrote one could not reproduce the empty turn.
+@@ -149,6 +164,7 @@ def emit():
+             print(json.dumps(event), flush=True)
+ 
+ 
++write_mcp_handshake()
+ emit_first = os.environ.get("OMP_STUB_EMIT_FIRST") == "1"
+ if emit_first:
+     emit()
+@@ -214,6 +230,83 @@ class TestBuildArgs:
+         assert "--model=opus-override" in agent._build_args(tmp_path, tmp_path, tmp_path)
+ 
+ 
++class TestTurnPrompt:
++    def test_mcp_tool_names_are_namespaced_for_omp(self, tmp_path: Path) -> None:
++        """The orchestrator names MCP tools bare, which is what Claude and codex
++        expose. omp exposes them as ``mcp__openscientist_tools_<name>``, so a bare
++        name comes back "Tool ... not found" and the analysis turn is lost."""
++        agent = _agent(tmp_path)
++        written = agent._write_turn_prompt(
++            "Call `execute_code` to analyse, then `update_knowledge_state`."
++        ).read_text()
++        assert "`mcp__openscientist_tools_execute_code`" in written
++        assert "`mcp__openscientist_tools_update_knowledge_state`" in written
++        assert "`execute_code`" not in written
++
++    def test_skill_bodies_are_namespaced_too(self, tmp_path: Path) -> None:
++        """Skills are a third prompt surface. A skill that names `execute_code`
++        bare teaches omp's agent a name that returns "Tool ... not found"."""
++        from openscientist.database.models import Skill
++
++        skill = Skill(
++            slug="demo",
++            category="workflow",
++            name="Demo",
++            description="d",
++            content="Run analysis with `execute_code`.",
++        )
++        agent = _agent(tmp_path)
++        agent._write_skill(tmp_path / "skills", skill)
++        body = (tmp_path / "skills" / "workflow--demo" / "SKILL.md").read_text()
++        assert "`mcp__openscientist_tools_execute_code`" in body
++        assert "`execute_code`" not in body
++
++    def test_builtin_tool_names_are_left_alone(self, tmp_path: Path) -> None:
++        """Only MCP tools are namespaced. omp's own tools are called bare, and the
++        report turn tells the agent to call ``write``."""
++        agent = _agent(tmp_path)
++        written = agent._write_turn_prompt("Call the `write` tool, then `read`.").read_text()
++        assert "`write`" in written
++        assert "`read`" in written
++        assert "mcp__openscientist_tools_write" not in written
++
++
++class TestMissingMcpToolsGuard:
++    """omp sometimes runs a turn without ever asking openscientist-tools for its
++    tools, with no error anywhere (openscientist-io#263), leaving the agent unable
++    to analyse or record while the turn still "succeeds". The server touches a
++    marker when asked, so its absence is the signal -- not the agent's own tool
++    choices, since a report turn legitimately calls only the built-in `write`."""
++
++    @pytest.mark.asyncio
++    async def test_completes_when_the_server_was_asked_for_its_tools(
++        self, tmp_path: Path, stub_bin: Path
++    ) -> None:
++        result = await _agent(tmp_path, system_prompt="SYS").run_iteration("go")
++        assert result.outcome is TurnOutcome.COMPLETED
++
++    @pytest.mark.asyncio
++    async def test_fails_when_the_server_was_never_asked(
++        self, tmp_path: Path, stub_bin: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setenv("OMP_STUB_MCP_HANDSHAKE", "0")
++        with pytest.raises(McpToolsUnavailableError, match="not available"):
++            await _agent(tmp_path, system_prompt="SYS").run_iteration("go")
++
++    @pytest.mark.asyncio
++    async def test_a_marker_left_by_an_earlier_turn_is_not_trusted(
++        self, tmp_path: Path, stub_bin: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Each turn respawns the server, so the marker must describe this run."""
++        monkeypatch.setenv("OMP_STUB_MCP_HANDSHAKE", "0")
++        agent = _agent(tmp_path, system_prompt="SYS")
++        marker = agent._mcp_handshake_marker()
++        marker.parent.mkdir(parents=True, exist_ok=True)
++        marker.touch()
++        with pytest.raises(McpToolsUnavailableError):
++            await agent.run_iteration("go")
++
++
+ class TestOmpConfigOverlay:
+     def test_disables_xdev_so_mcp_tools_are_callable(self, tmp_path: Path) -> None:
+         """With xdev on, the MCP tools are xd:// devices driven through write
+diff --git a/tests/test_pricing.py b/tests/test_pricing.py
+new file mode 100644
+index 00000000..057dc787
+--- /dev/null
++++ b/tests/test_pricing.py
+@@ -0,0 +1,74 @@
++"""Tests for `openscientist.providers.pricing`.
++
++The pricing table is fetched from litellm at runtime, so these patch it rather
++than asserting real rates, which would break whenever litellm updates.
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import AbstractContextManager
++from typing import Any
++from unittest.mock import patch
++
++import pytest
++
++from openscientist.providers.pricing import estimate_cost_usd, normalize_model_name
++
++_ENTRY = {
++    "input_cost_per_token": 5e-6,
++    "output_cost_per_token": 25e-6,
++    "cache_read_input_token_cost": 0.5e-6,
++    "cache_creation_input_token_cost": 6.25e-6,
++}
++
++
++def _patched(entry: dict[str, float] | None = None) -> AbstractContextManager[Any]:
++    return patch(
++        "openscientist.providers.pricing._get_litellm_pricing",
++        return_value={"m": entry if entry is not None else _ENTRY},
++    )
++
++
++def test_every_billed_bucket_is_priced() -> None:
++    """Cached reads dominate agentic runs; omitting them understates badly."""
++    with _patched():
++        cost = estimate_cost_usd("m", 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
++    # input 5 + output 25 + cache read 0.5 + cache write 6.25 + reasoning at output 25
++    assert cost == 61.75
++
++
++def test_reasoning_tokens_bill_as_output() -> None:
++    with _patched():
++        assert estimate_cost_usd("m", 0, 0, 0, 0, 1_000_000) == 25.0
++
++
++def test_cache_buckets_default_to_zero_so_old_callers_are_unchanged() -> None:
++    with _patched():
++        assert estimate_cost_usd("m", 1_000_000, 1_000_000) == 30.0
++
++
++def test_cache_rates_fall_back_to_the_input_rate_when_absent() -> None:
++    """Wrong, but closer than charging nothing for a real billed bucket."""
++    with _patched({"input_cost_per_token": 2e-6, "output_cost_per_token": 8e-6}):
++        assert estimate_cost_usd("m", 0, 0, 1_000_000, 1_000_000) == 4.0
++
++
++def test_unknown_model_warns_rather_than_silently_returning_zero(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    """A silent 0.0 is indistinguishable from a genuinely free run, which is how
++    prod recorded $0 for every Opus job on an unrecognised deployment name."""
++    with _patched(), caplog.at_level(logging.WARNING):
++        assert estimate_cost_usd("not-a-model", 1_000_000, 1_000_000) == 0.0
++    assert "No pricing entry" in caplog.text
++
++
++def test_azure_deployment_names_do_not_resolve() -> None:
++    """Documents a real gap: `claude-opus-4-8-2` is prod's deployment name, not a
++    model id, so it finds no entry. Bedrock/Vertex suffixes are handled; Azure
++    Foundry aliases are not."""
++    assert normalize_model_name("claude-opus-4-8-2") == "claude-opus-4-8-2"
++    assert normalize_model_name("us.anthropic.claude-sonnet-4-5-20250929-v1:0") == (
++        "claude-sonnet-4-5"
++    )
+diff --git a/tests/test_self_hosted_providers.py b/tests/test_self_hosted_providers.py
+index 00699bdc..cf5a6787 100644
+--- a/tests/test_self_hosted_providers.py
++++ b/tests/test_self_hosted_providers.py
+@@ -387,13 +387,16 @@ def test_prelaunch_env_injects_the_probed_window(spec: Spec) -> None:
+     assert env == {"OPENSCIENTIST_MODEL_CONTEXT_TOKENS": "40960"}
+ 
+ 
+-def test_prelaunch_env_is_empty_when_operator_pinned_the_window(spec: Spec) -> None:
++def test_prelaunch_env_forwards_the_operator_pin(spec: Spec) -> None:
++    """The pin is set in this process, but the container resolves the window on
++    its own side, so returning nothing left it probing and silently taking the
++    8192 fallback -- the outcome pinning exists to prevent. Still no probe here."""
+     with (
+         patch(_BASE_SETTINGS_PATH, return_value=spec.settings(model_context_tokens=1234)),
+         patch.object(spec.cls, "_probe_context_tokens") as probe,
+     ):
+         env = spec.cls().prelaunch_model_context_env()
+-    assert env == {}
++    assert env == {"OPENSCIENTIST_MODEL_CONTEXT_TOKENS": "1234"}
+     probe.assert_not_called()
+ 
+ 
+diff --git a/uv.lock b/uv.lock
+index eb4d1198..39f8468f 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -674,18 +674,20 @@ wheels = [
+ 
+ [[package]]
+ name = "claude-agent-sdk"
+-version = "0.1.46"
++version = "0.2.136"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "anyio" },
+     { name = "mcp" },
++    { name = "sniffio" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/cb/c8/27a7838a0c5c05057f2ecce6d5c8ee755d9a854fa46f3003c85d72dfbc12/claude_agent_sdk-0.1.46.tar.gz", hash = "sha256:7c2b6f3062ca6f016dacb8660660b4afe80935f4eabe0db677649edaddeef2ec", size = 86673, upload-time = "2026-03-05T00:36:27.36Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/67/ef/ecd4cc717d0af9b29c0202b2b69284582f1463e7429dc4e9f00c3c5c5771/claude_agent_sdk-0.2.136.tar.gz", hash = "sha256:a45bff05f629dc753992d960a944737c61de9efab4d5a798b0c4e83d21386bc3", size = 312189, upload-time = "2026-08-11T20:09:34.835Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/cd/16/bb883b6c39d1eba6ffe7cab421f5d91ce1b4937f6222dad3dd73641a40c5/claude_agent_sdk-0.1.46-py3-none-macosx_11_0_arm64.whl", hash = "sha256:66aed2199234d751a0f8c605ba34d1b3d93e94b4e939526ee04ca243ba74cf62", size = 59414852, upload-time = "2026-03-05T00:36:10.715Z" },
+-    { url = "https://files.pythonhosted.org/packages/99/f3/0c65254ee57940a17ccff1d9a4291d6f856fbf9f87de108e866c7de2fe86/claude_agent_sdk-0.1.46-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:440f0923811f9e1c6c992655beadb527eb2ed4024059880018fd6ec92846d429", size = 75211569, upload-time = "2026-03-05T00:36:15.222Z" },
+-    { url = "https://files.pythonhosted.org/packages/6d/a1/3f34e77042eca1d4a12b90e643f7aa5f64201f9259e138c5ba62751194e4/claude_agent_sdk-0.1.46-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:460ab0ad549331dc35ef1bc212a7cd8e8b4d2876b10df7bfa9f4000c95b94c15", size = 75916106, upload-time = "2026-03-05T00:36:19.651Z" },
+-    { url = "https://files.pythonhosted.org/packages/3b/0a/2c2cfd0f39de1bb864d6804db0094453ae4270de4a76e44343459e28b9e8/claude_agent_sdk-0.1.46-py3-none-win_amd64.whl", hash = "sha256:4d0d5b14ad04d6e8fbe5b1ffe3e48d0da38d2602e9efc4f21f0e4593987cf67a", size = 77103700, upload-time = "2026-03-05T00:36:24.449Z" },
++    { url = "https://files.pythonhosted.org/packages/c2/38/06ef7686e0de2ef66257f22f055ff4e79d63f20d0cbd822eeea70ac346e2/claude_agent_sdk-0.2.136-py3-none-macosx_11_0_arm64.whl", hash = "sha256:40c74bf4d75d35991bc006c24b4ab6c0cecd8d5467dd1d9520b02d27507e59f3", size = 83253479, upload-time = "2026-08-11T20:09:41.119Z" },
++    { url = "https://files.pythonhosted.org/packages/8a/cf/744bbf0f612e28d771da748f3bfeab9800fc8be753e8677473cba1d16961/claude_agent_sdk-0.2.136-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:bcd90b2960b463141a84a0c7fcf6c957555cf96169e6cfedee430498dc40b775", size = 88598004, upload-time = "2026-08-11T20:09:48.209Z" },
++    { url = "https://files.pythonhosted.org/packages/5f/44/c654a8af1c3505f15332c6d7e32adbb8b800acfa9901cfaccab1c851f822/claude_agent_sdk-0.2.136-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:12f0b97f49d429b9e06a62a1f56ec10fc8b4435bff6e83207837d47a7871a9a6", size = 93319413, upload-time = "2026-08-11T20:09:55.157Z" },
++    { url = "https://files.pythonhosted.org/packages/98/67/1a9018e2cfe0a790b905977f0c48894014bfd1cf616f230d1f1499b0d8e5/claude_agent_sdk-0.2.136-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:a07d17456b8759fac35ed9ae6cdfdc065bc690669b0a8cc80bd7d9c8d4f1623f", size = 94452952, upload-time = "2026-08-11T20:10:02.885Z" },
++    { url = "https://files.pythonhosted.org/packages/c7/14/b0488725da3341c7aa4e44920e59ca1fa5183645e7a8e7ef8a3924ef1626/claude_agent_sdk-0.2.136-py3-none-win_amd64.whl", hash = "sha256:e4cc387b68c8fee5e32bdcf7f38c249cd2f0ebf4bc3ae04a459a83785e541d89", size = 93503605, upload-time = "2026-08-11T20:10:09.949Z" },
+ ]
+ 
+ [[package]]
